@@ -1,0 +1,151 @@
+--- a/src/capt-command.c
++++ b/src/capt-command.c
+@@ -28,9 +28,91 @@
+ #include <cups/cups.h>
+ #include <cups/sidechannel.h>
+ 
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
+ static uint8_t capt_iobuf[0x10000];
+ static size_t  capt_iosize;
+ 
++/*
++ * Direct device mode.
++ *
++ * The CUPS back channel never delivers the printer's replies on some
++ * host/backend combinations, so the very first CAPT command times out and the
++ * driver gives up. The printer itself answers fine over the usblp character
++ * device, so when one is available we bypass the CUPS channels entirely and
++ * do our own reads and writes. Set CAPT_DEVICE to override the path, or
++ * CAPT_DEVICE="" to force the original CUPS channels.
++ */
++
++#ifndef LPIOC_GET_DEVICE_ID
++#define LPIOC_GET_DEVICE_ID(len) _IOC(_IOC_READ, 'P', 1, len)
++#endif
++
++static int capt_fd = -2; /* -2 not tried yet, -1 unavailable */
++
++static int capt_direct(void)
++{
++	if (capt_fd == -2) {
++		const char *dev = getenv("CAPT_DEVICE");
++		if (!dev)
++			dev = "/dev/usb/lp0";
++		if (!*dev) {
++			capt_fd = -1;
++			fprintf(stderr, "DEBUG: CAPT: direct mode disabled\n");
++			return capt_fd;
++		}
++		capt_fd = open(dev, O_RDWR);
++		if (capt_fd < 0)
++			fprintf(stderr, "DEBUG: CAPT: no direct device %s (%s), "
++					"falling back to CUPS channels\n", dev, strerror(errno));
++		else
++			fprintf(stderr, "DEBUG: CAPT: talking directly to %s\n", dev);
++	}
++	return capt_fd;
++}
++
++static ssize_t capt_direct_read(void *buf, size_t expected, int timeout_ms)
++{
++	int fd = capt_direct();
++	size_t got = 0;
++	while (got < expected) {
++		struct pollfd pfd;
++		ssize_t n;
++		pfd.fd = fd;
++		pfd.events = POLLIN;
++		pfd.revents = 0;
++		if (poll(&pfd, 1, timeout_ms) <= 0)
++			break;
++		n = read(fd, (char *) buf + got, expected - got);
++		if (n <= 0)
++			break;
++		got += (size_t) n;
++	}
++	return (ssize_t) got;
++}
++
++static int capt_direct_write(const void *buf, size_t size)
++{
++	int fd = capt_direct();
++	const char *p = buf;
++	while (size > 0) {
++		ssize_t n = write(fd, p, size);
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			return -1;
++		}
++		p += n;
++		size -= (size_t) n;
++	}
++	return 0;
++}
++
+ static void capt_debug_buf(const char *level, size_t size)
+ {
+ 	size_t i;
+@@ -64,6 +146,17 @@
+ 		if (sendsize > 4096)
+ 			sendsize = 4096;
+ 
++		if (capt_direct() >= 0) {
++			if (capt_direct_write(iopos, sendsize) < 0) {
++				fprintf(stderr, "ERROR: CAPT: cannot write to printer: %s\n",
++					strerror(errno));
++				exit(1);
++			}
++			iopos += sendsize;
++			iosize -= sendsize;
++			continue; /* a direct write is already drained */
++		}
++
+ 		fwrite(iopos, 1, sendsize, stdout);
+ 		iopos += sendsize;
+ 		iosize -= sendsize;
+@@ -92,8 +185,11 @@
+ 		exit(1);
+ 	}
+ 	fprintf(stderr, "DEBUG: CAPT: waiting for %u bytes\n", (unsigned) expected);
+-	size = cupsBackChannelRead((char *) capt_iobuf + offset, expected, 15.0);
+-	if (size < 0) {
++	if (capt_direct() >= 0)
++		size = capt_direct_read(capt_iobuf + offset, expected, 15000);
++	else
++		size = cupsBackChannelRead((char *) capt_iobuf + offset, expected, 15.0);
++	if (size <= 0) {
+ 		fprintf(stderr, "ERROR: CAPT: no reply from printer\n");
+ 		exit(1);
+ 	}
+@@ -102,6 +198,24 @@
+ 
+ const char *capt_identify(void)
+ {
++	if (capt_direct() >= 0) {
++		unsigned char idbuf[1024];
++		memset(idbuf, 0, sizeof(idbuf));
++		if (ioctl(capt_fd, LPIOC_GET_DEVICE_ID(sizeof(idbuf)), idbuf) == 0) {
++			size_t n = ((size_t) idbuf[0] << 8) | idbuf[1];
++			if (n > 2 && n <= sizeof(idbuf)) {
++				n -= 2;
++				memcpy(capt_iobuf, idbuf + 2, n);
++				capt_iobuf[n] = '\0';
++				capt_iosize = n;
++				fprintf(stderr, "DEBUG: CAPT: printer ID string %s\n", capt_iobuf);
++				return (const char *) capt_iobuf;
++			}
++		}
++		fprintf(stderr, "DEBUG: CAPT: direct device ID failed (%s), "
++				"trying CUPS side channel\n", strerror(errno));
++	}
++
+ 	while (1) {
+ 		cups_sc_status_t status;
+ 		capt_iosize = sizeof(capt_iobuf) - 1;
