@@ -1,6 +1,8 @@
 # Canon LBP2900 — Hồ sơ vận hành & khắc phục sự cố
 
-Tài liệu nội bộ về chiếc **Canon LBP2900** (văn phòng Hà Nội, cắm USB vào máy `hn-kt-nam`), đúc kết từ một phiên chẩn đoán thực tế ngày 13/08/2026: máy "không in được", tưởng hỏng, cuối cùng **không hỏng gì cả** — toàn bộ là lỗi trạng thái phần mềm, và đã sửa xong từ xa.
+Tài liệu nội bộ về chiếc **Canon LBP2900** ở văn phòng Hà Nội, đúc kết từ hai phiên xử lý thực tế (13–15/08/2026): máy "không in được", tưởng hỏng, cuối cùng **không hỏng gì cả** — toàn bộ là lỗi trạng thái phần mềm.
+
+**Cấu hình hiện tại:** máy in cắm USB vào `hn-kt-thao` (Ubuntu, `192.168.1.36`), chạy `captdriver` đã vá, chia sẻ ra LAN qua CUPS cho 4 máy Windows và 1 máy Linux. Xem [`docs/lan-sharing.md`](docs/lan-sharing.md).
 
 Repo này gồm: chẩn đoán đầy đủ, script sửa lỗi dùng lại được, một CUPS backend để in từ Linux xuyên qua Windows, và một bản vá cho driver mã nguồn mở `captdriver`.
 
@@ -72,12 +74,18 @@ scripts/windows/          Bộ script PowerShell chạy trên máy cắm máy in
 scripts/linux/            In từ Linux khi máy in cắm ở máy Windows
   winbridge                 CUPS backend: CUPS -> scp -> SumatraPDF -> driver Canon
 
+scripts/windows-clients/  Chạy trên máy Windows để dùng máy in chia sẻ từ Linux
+  addipp.ps1                Thêm máy in qua IPP, driver PostScript, không đổi mặc định
+  checkconn.ps1             Kiểm tra máy Windows có kết nối được tới server không
+  listprinters.ps1          Liệt kê máy in đang cài trên máy đó
+
 captdriver-patch/         Cho trường hợp cắm máy in trực tiếp vào Linux
   direct-device-mode.patch  Vá captdriver nói thẳng /dev/usb/lp0
 
 docs/
+  lan-sharing.md               Cấu hình đang chạy: chia sẻ từ Linux ra LAN  <- đọc cái này
   windows-troubleshooting.md   Quy trình chẩn đoán từng bước trên Windows
-  linux-bridge.md              Cài đặt bridge in từ Ubuntu qua Windows
+  linux-bridge.md              Bridge in từ Ubuntu qua Windows (phương án thay thế)
   captdriver-notes.md          Ghi chép về driver Linux + bản vá
 ```
 
@@ -85,7 +93,7 @@ docs/
 
 ## In từ Linux — hai con đường
 
-### Đường 1: bridge qua Windows (đang dùng, ổn định)
+### Đường 1: bridge qua Windows (phương án dự phòng)
 
 Máy in giữ nguyên ở máy Windows. Máy Linux in qua CUPS backend `winbridge`:
 
@@ -96,14 +104,20 @@ CUPS (queue Canon_LBP2900_Bridge, PPD Generic PDF)
   -> driver Canon chính chủ dựng trang -> USB
 ```
 
-Ưu: driver Windows chính chủ, ổn định. Nhược: máy Windows phải bật.
+Ưu: driver Windows chính chủ, ổn định. Nhược: máy Windows phải bật. Dùng khi captdriver không chạy được trên phần cứng cụ thể.
 Chi tiết cài đặt: [`docs/linux-bridge.md`](docs/linux-bridge.md)
 
-### Đường 2: cắm thẳng vào Linux + captdriver (thử nghiệm)
+### Đường 2: cắm thẳng vào Linux + captdriver — ĐANG DÙNG
 
 Driver mã nguồn mở [captdriver](https://github.com/mounaiban/captdriver) chạy được trên Ubuntu 24.04, **nhưng** trên máy chúng tôi kênh side/back-channel của CUPS không truyền dữ liệu, driver chết ở lệnh CAPT đầu tiên — đúng [Issue #16](https://github.com/agalakhov/captdriver/issues/16) tồn tại nhiều năm.
 
-Bản vá trong `captdriver-patch/` thêm **chế độ nói thẳng `/dev/usb/lp0`** (bỏ qua kênh CUPS), đã đưa driver vượt qua điểm chết đó. Chưa in ra giấy thành công trọn vẹn vì đúng lúc test thì máy in đang kẹt trạng thái (lỗi #2 ở trên) — cần thử lại khi có dịp. Chi tiết: [`docs/captdriver-notes.md`](docs/captdriver-notes.md)
+Bản vá trong `captdriver-patch/` thêm **chế độ nói thẳng `/dev/usb/lp0`** (bỏ qua kênh CUPS). **Đã in ra giấy thành công** (Job 109, 15/08/2026, 0 lỗi CAPT trong log).
+
+Đây là cấu hình đang chạy: máy in cắm ở `hn-kt-thao`, chia sẻ ra LAN cho các máy Windows và Linux khác. Xem [`docs/lan-sharing.md`](docs/lan-sharing.md).
+
+⚠️ Điều kiện sống còn: `/dev/usb/lp0` phải tồn tại (cần `usblp`). Mất node này là mọi job chết với `CAPT: unable to communicate with printer`.
+
+Chi tiết kỹ thuật: [`docs/captdriver-notes.md`](docs/captdriver-notes.md)
 
 ---
 
@@ -113,3 +127,4 @@ Bản vá trong `captdriver-patch/` thêm **chế độ nói thẳng `/dev/usb/l
 - Máy in "đơ" ≠ máy in hỏng. Với LBP2900, 99% là trạng thái kẹt — reset USB + tắt bật nguồn giải quyết.
 - Xoá job của người khác thì phải báo cho họ in lại — job `Retained` có thể đã in xong, nhưng job `Normal` phía sau thì chưa.
 - Đèn LED trên máy là nguồn chân lý duy nhất về phần cứng: xanh đứng yên = khoẻ, cam/nháy = xem mực/giấy/nắp.
+- Sau mỗi lần reboot máy chủ in hoặc cắm lại cáp: kiểm tra `/dev/usb/lp0` trước khi kết luận máy in hỏng.
