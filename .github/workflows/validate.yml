@@ -1,0 +1,55 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            build-essential \
+            cups-ppdc \
+            libcups2-dev \
+            shellcheck
+
+      - name: Check release script
+        run: shellcheck scripts/release/build-patched-driver.sh
+
+      - name: Build patched source package
+        run: scripts/release/build-patched-driver.sh dist
+
+      - name: Verify checksum
+        working-directory: dist
+        run: sha256sum -c captdriver-0.1.4.1-direct-device.1.tar.gz.sha256
+
+      - name: Build driver from release package
+        run: |
+          mkdir -p /tmp/lbp2900-package-test
+          tar -xzf dist/captdriver-0.1.4.1-direct-device.1.tar.gz \
+            -C /tmp/lbp2900-package-test
+          cd /tmp/lbp2900-package-test/captdriver-0.1.4.1-direct-device.1
+          autoreconf -i
+          ./configure
+          make -j"$(nproc)"
+
+      - name: Check patch and documentation
+        run: |
+          git diff --check
+          test ! -e docs/linux-bridge.md
+          test ! -e scripts/linux/winbridge
+          ! grep -R -E '192\.168\.1\.36|hn-kt-|hn-02' README.md docs scripts

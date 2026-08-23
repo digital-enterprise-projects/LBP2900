@@ -1,114 +1,146 @@
-# captdriver + LBP2900 — ghi chép thử nghiệm và bản vá
+# captdriver direct-device cho Canon LBP2900
 
-Ghi lại từ phiên thử cắm LBP2900 **trực tiếp vào Ubuntu 24.04** (`hn-kt-thao`), 13–15/08/2026. Driver mã nguồn mở vướng lỗi kênh truyền của CUPS; bản vá trong repo này đưa nó vượt qua điểm chết và **đã in ra giấy thành công**.
+Canon LBP2900 là máy in host-based: máy tính phải chuyển trang in sang giao thức CAPT trước khi gửi qua USB. Repository này dùng `captdriver` mã nguồn mở và bổ sung chế độ truy cập trực tiếp thiết bị `usblp` để tránh lỗi back-channel trên một số tổ hợp CUPS/libusb.
 
-## Bối cảnh driver
+## Khi nào cần bản vá
 
-| Driver | Tình trạng |
-|---|---|
-| Canon CAPT chính chủ (`ccpd`) | **Hỏng hẳn** trên Ubuntu 24.04 — cập nhật lần cuối cho 14.04, sinh 70+ tiến trình zombie |
-| [mounaiban/captdriver](https://github.com/mounaiban/captdriver) | Mã nguồn mở, reverse-engineered, còn bảo trì. LBP2900 được hỗ trợ. Hạn chế đã biết: kén tổ hợp kiến trúc/OS do vấn đề USB backend của CUPS |
-| [agalakhov/captdriver](https://github.com/agalakhov/captdriver) | Repo gốc, có sẵn PPD LBP2900 |
+Bản vá phù hợp khi có đủ các dấu hiệu sau:
 
-## Cài đặt chuẩn (phần chạy được)
+- `lsusb` nhìn thấy máy in Canon.
+- `/dev/usb/lp0` tồn tại và đọc được IEEE-1284 device ID.
+- `captdriver` chưa vá dừng ở lệnh CAPT đầu tiên với `CAPT: no reply from printer`.
+- Backend USB của CUPS không chuyển phản hồi từ máy in về filter qua `cupsBackChannelRead()`.
 
-```bash
-sudo apt install build-essential automake autoconf libcups2-dev cups-ppdc git
-git clone https://github.com/mounaiban/captdriver && cd captdriver
-autoreconf -i && ./configure && make
-sudo install -m 0755 src/rastertocapt /usr/lib/cups/filter/
-cd src && ppdc canon-lbp.drv -d /tmp/ppdgen        # sinh PPD từ chính repo
-sudo install -m 0644 /tmp/ppdgen/CanonLBP-2900-3000.ppd /usr/share/ppd/
-sudo lpadmin -p Canon_LBP2900 -E -v "usb://Canon/LBP2900?serial=<serial>" \
-  -P /usr/share/ppd/CanonLBP-2900-3000.ppd
-```
+Nếu không có `/dev/usb/lp0`, hãy xử lý module `usblp`, cáp và cổng USB trước. Bản vá không sửa lỗi phần cứng hoặc lỗi kết nối vật lý.
 
-## Lỗi gặp phải và chẩn đoán
+## Cơ chế
 
-Triệu chứng: mọi job chết với
+File [direct-device-mode.patch](../captdriver-patch/direct-device-mode.patch) thay đổi `src/capt-command.c`:
 
-```
-CAPT: send  A1 A1 04 00
-CAPT: waiting for 6 bytes
-ERROR: CAPT: no reply from printer
-```
-
-Trùng với [agalakhov#16](https://github.com/agalakhov/captdriver/issues/16) và [mounaiban#3](https://github.com/mounaiban/captdriver/issues/3) — mở nhiều năm, không có lời giải.
-
-Chẩn đoán của chúng tôi (điểm mới so với các issue):
-
-- Máy in **trả lời tốt** truy vấn IEEE-1284 device ID qua `ioctl` trực tiếp trên `/dev/usb/lp0` → phần cứng và kênh USB hai chiều đều thông.
-- `cupsSideChannelDoRequest(GET_DEVICE_ID)` cũng chạy → side channel OK.
-- Riêng **`cupsBackChannelRead()` không bao giờ nhận được byte nào** → back channel của backend `usb` (libusb) là mắt xích hỏng.
-- Thử `file:///dev/usb/lp0` thay backend `usb`: chết sớm hơn, vì backend `file` **không có** side/back channel nào cả.
-
-Kết luận: lỗi không nằm ở giao thức CAPT của driver (giao thức đúng), mà ở **đường vận chuyển phản hồi** qua CUPS trên tổ hợp máy này.
-
-## Bản vá: chế độ nói thẳng thiết bị
-
-`captdriver-patch/direct-device-mode.patch` — áp vào `src/capt-command.c`:
-
-```bash
-cd captdriver && patch -p1 < direct-device-mode.patch && make
-```
-
-Nội dung: khi mở được `/dev/usb/lp0` (module `usblp`), driver **tự đọc/ghi thiết bị**, bỏ qua toàn bộ kênh CUPS:
-
-| Đường | Gốc | Sau vá |
+| Chức năng | captdriver mặc định | Chế độ direct-device |
 |---|---|---|
-| Gửi lệnh/dữ liệu | `fwrite(stdout)` → backend | `write(fd)` thẳng |
-| Nhận phản hồi CAPT | `cupsBackChannelRead()` | `poll()` + `read(fd)` |
-| Đọc device ID | side channel | `ioctl(LPIOC_GET_DEVICE_ID)` |
-| Drain | side channel | không cần |
+| Gửi lệnh/dữ liệu | ghi ra `stdout` cho backend CUPS | `write()` trực tiếp vào `/dev/usb/lpN` |
+| Nhận phản hồi CAPT | `cupsBackChannelRead()` | `poll()` và `read()` trực tiếp |
+| Đọc device ID | CUPS side-channel | `ioctl(LPIOC_GET_DEVICE_ID)` |
+| Khi không mở được thiết bị | không áp dụng | fallback về CUPS channel |
 
-- Tự fallback về kênh CUPS nếu không mở được thiết bị.
-- `CAPT_DEVICE=/dev/usb/lpN` để đổi thiết bị; `CAPT_DEVICE=""` tắt hẳn chế độ mới.
-- Queue nên trỏ `-v file:///dev/null` (bật `FileDevice Yes` trong `cups-files.conf`) để backend CUPS không tranh thiết bị với filter.
-- Cần `usblp` nạp sẵn: `echo usblp | sudo tee /etc/modules-load.d/usblp.conf`
+Thiết bị mặc định là `/dev/usb/lp0`.
 
-## Kết quả và trạng thái
+- Đặt `CAPT_DEVICE=/dev/usb/lp1` để chọn node khác.
+- Đặt `CAPT_DEVICE=` để tắt direct-device và dùng hành vi gốc.
 
-Sau vá, log lần đầu tiên vượt qua điểm chết:
-
-```
-CAPT: talking directly to /dev/usb/lp0
-CAPT: printer ID string MFG:Canon;MDL:LBP2900;CMD:CAPT;VER:2.1
-CAPT: detected printer 'LBP2900'
-CAPT: send  A1 A1 04 00          <- không còn "no reply"
-```
-
-Sau đó kẹt ở `write()` (`usblp_wwait` trong kernel) — **nhưng** cùng thời điểm đó máy in đang kẹt trạng thái controller (nó cũng không nhận dữ liệu từ chính Windows). Vụ kẹt này sau được xử lý bằng reset USB phía Windows, còn máy in thì đã trả về máy Windows trước khi kịp thử lại bản vá trên nền máy in khoẻ.
-
-### Cập nhật 15/08/2026 — bản vá ĐÃ IN ĐƯỢC
-
-Sau khi máy in được trả về trạng thái khoẻ và cắm lại vào Ubuntu, bản vá hoạt động thật:
-
-```
-I [15/Aug/2026:08:46:16] [Job 109] Job completed.
-so loi "CAPT: no reply|unable" trong error_log: 0
-```
-
-**Trạng thái: bản vá vượt qua lỗi #16 và in ra giấy thành công.** Đủ điều kiện gửi PR lên `mounaiban/captdriver` kèm chẩn đoán ở trên. Trước khi gửi nên sửa patch thành **fallback-only** (mặc định giữ kênh CUPS, chỉ chuyển sang thiết bị trực tiếp khi back channel lỗi) — không đổi hành vi của người đang dùng bình thường thì khả năng merge cao hơn nhiều.
-
-### Điều kiện vận hành bắt buộc
-
-Bản vá phụ thuộc `/dev/usb/lp0`. Mất node này là mọi job chết với `CAPT: unable to communicate with printer` — vì driver quay về kênh CUPS, mà queue lại dùng backend `file:///dev/null` không có side channel. Node biến mất sau mỗi lần reboot hoặc cắm lại cáp nếu `usblp` chưa được cấu hình tự nạp. Xem `lan-sharing.md`.
-
-## Mẹo chẩn đoán nhanh khi "máy in không trả lời" trên Linux
+## Build và cài đặt
 
 ```bash
-# May in co song khong? (khong can driver gi)
-sudo python3 -c "
-import fcntl, os
-fd = os.open('/dev/usb/lp0', os.O_RDWR)
-buf = bytearray(1024)
-fcntl.ioctl(fd, 0x84005001, buf)          # LPIOC_GET_DEVICE_ID
-n = (buf[0]<<8 | buf[1])
-print(buf[2:n].decode('latin-1'))
-"
-# Tra loi MFG:Canon;MDL:LBP2900... = phan cung + cap + USB OK
-# -> loi nam o driver/kenh truyen, khong phai may in
+REPO_DIR="$PWD"
 
-# Tien trinh in dang ket o dau trong kernel?
-sudo cat /proc/<pid>/wchan     # usblp_wwait = may in khong rut du lieu (controller ket / loi vat ly)
+sudo apt update
+sudo apt install -y build-essential automake autoconf libcups2-dev cups-ppdc git patch
+git clone https://github.com/mounaiban/captdriver.git /tmp/captdriver
+
+cd /tmp/captdriver
+patch -p1 < "$REPO_DIR/captdriver-patch/direct-device-mode.patch"
+autoreconf -i
+./configure
+make
+
+sudo install -m 0755 src/rastertocapt /usr/lib/cups/filter/rastertocapt
+mkdir -p /tmp/captdriver-ppd
+(cd src && ppdc canon-lbp.drv -d /tmp/captdriver-ppd)
+sudo install -m 0644 /tmp/captdriver-ppd/CanonLBP-2900-3000.ppd /usr/share/ppd/CanonLBP-2900-3000.ppd
 ```
+
+Sau mỗi lần cập nhật source `captdriver`, chạy lại patch và build. Nếu `patch` báo hunk failed, không tiếp tục cài binary cũ; cần kiểm tra thay đổi upstream và cập nhật patch.
+
+## Cấu hình `usblp`
+
+```bash
+echo usblp | sudo tee /etc/modules-load.d/usblp.conf
+sudo modprobe usblp
+ls -l /dev/usb/lp*
+```
+
+Kiểm tra device ID:
+
+```bash
+sudo python3 - <<'PY'
+import fcntl
+import os
+
+path = os.environ.get("CAPT_DEVICE", "/dev/usb/lp0")
+fd = os.open(path, os.O_RDWR)
+try:
+    data = bytearray(1024)
+    fcntl.ioctl(fd, 0x84005001, data)
+    size = (data[0] << 8) | data[1]
+    print(data[2:size].decode("latin-1"))
+finally:
+    os.close(fd)
+PY
+```
+
+Chuỗi trả về phải nhận diện đúng nhà sản xuất, model và `CMD:CAPT`.
+
+## Cấu hình CUPS bắt buộc
+
+Direct-device tự giữ `/dev/usb/lpN`, vì vậy backend của queue không được giữ cùng thiết bị:
+
+```bash
+grep -q '^FileDevice Yes$' /etc/cups/cups-files.conf || \
+  echo 'FileDevice Yes' | sudo tee -a /etc/cups/cups-files.conf
+
+sudo lpadmin -p Canon_LBP2900 -E \
+  -v file:///dev/null \
+  -P /usr/share/ppd/CanonLBP-2900-3000.ppd
+sudo systemctl restart cups
+```
+
+Không dùng `usb://Canon/...` cho queue này khi direct-device đang bật.
+
+## Máy chủ có nhiều thiết bị `/dev/usb/lpN`
+
+Số thứ tự `lpN` có thể đổi sau reboot. Với môi trường nhiều máy in USB, tạo symlink ổn định bằng udev và truyền đường dẫn đó qua `CAPT_DEVICE` cho CUPS.
+
+Ví dụ quy tắc `/etc/udev/rules.d/70-canon-lbp2900.rules`:
+
+```udev
+SUBSYSTEM=="usb", ATTR{idVendor}=="04a9", ATTR{idProduct}=="2676", SYMLINK+="canon-lbp2900"
+```
+
+Mã `idProduct` phải lấy từ `lsusb` trên thiết bị thực tế, không sao chép máy móc từ ví dụ. Sau đó cấu hình biến môi trường của service CUPS theo cơ chế của bản phân phối để `CAPT_DEVICE=/dev/canon-lbp2900`, rồi restart CUPS.
+
+## Đọc log
+
+```bash
+sudo grep -E 'CAPT:|Unable|Error' /var/log/cups/error_log | tail -n 100
+sudo journalctl -u cups --since '10 minutes ago' --no-pager
+```
+
+Các thông báo chính:
+
+| Log | Ý nghĩa | Hành động |
+|---|---|---|
+| `CAPT: talking directly to ...` | direct-device đã mở thành công | tiếp tục theo dõi job |
+| `CAPT: no direct device ... falling back` | không mở được node đã cấu hình | kiểm tra `CAPT_DEVICE`, `usblp`, permission |
+| `CAPT: no reply from printer` | không nhận được phản hồi CAPT | kiểm tra patch đang chạy, USB và trạng thái máy in |
+| `CAPT: cannot write to printer` | ghi xuống thiết bị thất bại | kiểm tra cáp, nguồn, kernel log |
+| `CAPT: unable to communicate` | cả direct-device và channel dự phòng đều không dùng được | khôi phục device node rồi restart CUPS |
+
+Kiểm tra kernel khi tiến trình bị treo:
+
+```bash
+sudo dmesg --ctime | tail -n 100
+sudo cat /proc/<PID>/wchan
+```
+
+`usblp_wwait` kéo dài cho thấy tiến trình đang chờ thiết bị nhận dữ liệu; cần kiểm tra trạng thái máy in, USB và nguồn trước khi thay đổi driver.
+
+## Hoàn tác
+
+Để quay về captdriver nguyên bản:
+
+1. Build lại source sạch không áp patch.
+2. Cài lại `rastertocapt`.
+3. Đổi URI queue sang backend USB phù hợp.
+4. Đặt `CAPT_DEVICE=` hoặc bỏ cấu hình biến môi trường.
+5. Restart CUPS và in trang thử.

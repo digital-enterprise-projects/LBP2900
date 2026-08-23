@@ -1,141 +1,232 @@
-# Chia sẻ LBP2900 ra LAN từ máy Linux
+# Triển khai Canon LBP2900 dùng chung qua CUPS/IPP
 
-Cấu hình đang chạy (15/08/2026): máy in cắm USB vào **`hn-kt-thao`** (Ubuntu 24.04, `192.168.1.36`), dùng `captdriver` đã vá, chia sẻ ra LAN qua CUPS. Các máy Windows và Linux khác in vào đó qua IPP.
+Tài liệu này mô tả cấu hình triển khai chuẩn cho một đơn vị: máy in kết nối USB với máy chủ Linux, còn máy trạm sử dụng IPP qua LAN.
 
-```
-Canon LBP2900 (USB)
-  -> hn-kt-thao: usblp -> /dev/usb/lp0 -> captdriver (da va) -> CUPS
-  -> chia se IPP tren 0.0.0.0:631
-  -> may Windows / Linux khac trong LAN
-```
+## Kiến trúc
 
-## Phía server (`hn-kt-thao`)
-
-### Bắt buộc: `/dev/usb/lp0` phải tồn tại
-
-Bản vá captdriver nói **thẳng** với thiết bị này. Không có nó, driver quay về kênh CUPS, mà queue dùng backend `file:///dev/null` (không có side channel) nên mọi job chết với:
-
-```
-CAPT: unable to communicate with printer
+```text
+[Canon LBP2900]
+        │ USB
+        ▼
+[Linux print server]
+  usblp → /dev/usb/lp0
+  captdriver direct-device patch
+  CUPS queue: Canon_LBP2900
+        │ IPP/TCP 631
+        ├──────────────► [Windows clients]
+        └──────────────► [Linux clients]
 ```
 
-Đây là lỗi số một sau mỗi lần khởi động lại hoặc cắm lại cáp. Cách xử lý:
+Luồng dữ liệu trên máy chủ có một điểm đặc biệt: filter `rastertocapt` tự ghi vào `/dev/usb/lp0`. Vì vậy URI của queue là `file:///dev/null`; backend CUPS chỉ đóng vai trò nhận job và chạy filter, không được mở thiết bị USB thêm lần nữa.
+
+## Yêu cầu
+
+- Máy chủ Linux có IP tĩnh hoặc DHCP reservation.
+- Máy in cắm trực tiếp vào USB của máy chủ, không qua hub nếu có thể.
+- Máy trạm truy cập được TCP 631 trên máy chủ.
+- Người triển khai có quyền `sudo` trên máy chủ và Administrator trên Windows.
+- Đã cài filter/PPD theo phần triển khai nhanh trong [README](../README.md).
+
+Ví dụ trong tài liệu dùng:
+
+```bash
+PRINT_SERVER_IP="192.168.10.20"
+LAN_CIDR="192.168.10.0/24"
+QUEUE_NAME="Canon_LBP2900"
+PPD_PATH="/usr/share/ppd/CanonLBP-2900-3000.ppd"
+```
+
+Thay các giá trị này theo mạng của đơn vị.
+
+## 1. Xác nhận thiết bị USB
+
+```bash
+lsusb | grep -i canon
+sudo modprobe usblp
+ls -l /dev/usb/lp*
+```
+
+Để tự nạp `usblp` sau khi khởi động:
+
+```bash
+echo usblp | sudo tee /etc/modules-load.d/usblp.conf
+```
+
+Kiểm tra IEEE-1284 device ID mà không gửi job in:
+
+```bash
+sudo python3 - <<'PY'
+import fcntl
+import os
+
+path = os.environ.get("CAPT_DEVICE", "/dev/usb/lp0")
+fd = os.open(path, os.O_RDWR)
+try:
+    buf = bytearray(1024)
+    fcntl.ioctl(fd, 0x84005001, buf)  # LPIOC_GET_DEVICE_ID
+    size = (buf[0] << 8) | buf[1]
+    print(buf[2:size].decode("latin-1"))
+finally:
+    os.close(fd)
+PY
+```
+
+Kết quả hợp lệ có `MFG:Canon`, `MDL:LBP2900` và `CMD:CAPT`. Nếu lệnh không mở được thiết bị, xử lý USB/permission trước khi cấu hình CUPS.
+
+## 2. Cấu hình queue CUPS
+
+Cho phép backend `file://`:
+
+```bash
+grep -q '^FileDevice Yes$' /etc/cups/cups-files.conf || \
+  echo 'FileDevice Yes' | sudo tee -a /etc/cups/cups-files.conf
+```
+
+Tạo queue:
+
+```bash
+sudo lpadmin -p "$QUEUE_NAME" -E \
+  -v file:///dev/null \
+  -P "$PPD_PATH" \
+  -D "Canon LBP2900"
+sudo lpadmin -p "$QUEUE_NAME" -o printer-is-shared=true
+```
+
+Không thay `file:///dev/null` bằng `usb://...` khi đang dùng bản vá direct-device. Hai tiến trình cùng giữ cổng USB có thể làm job bị treo.
+
+## 3. Chia sẻ trong LAN
+
+```bash
+sudo cupsctl --share-printers --remote-any
+sudo systemctl enable --now cups
+sudo systemctl restart cups
+sudo ss -lntp | grep ':631'
+```
+
+Nếu dùng UFW:
+
+```bash
+sudo ufw allow from "$LAN_CIDR" to any port 631 proto tcp
+```
+
+Nếu dùng firewall khác, tạo quy tắc tương đương: chỉ cho phép nguồn thuộc LAN truy cập TCP 631. Không NAT/port-forward cổng này ra Internet.
+
+Kiểm tra từ một máy khác:
+
+```bash
+curl -I "http://$PRINT_SERVER_IP:631/printers/$QUEUE_NAME"
+```
+
+HTTP `200`, `401` hoặc `403` đều chứng minh đã tới được CUPS; `Connection refused` hoặc timeout là lỗi service, firewall hoặc định tuyến.
+
+## 4. Thêm máy trạm Windows
+
+Từ PowerShell Administrator tại thư mục repository:
+
+```powershell
+.\scripts\windows-clients\addipp.ps1 `
+  -Server 192.168.10.20 `
+  -QueueName Canon_LBP2900 `
+  -PrinterName "Canon LBP2900 - Van phong"
+```
+
+Kiểm tra:
+
+```powershell
+.\scripts\windows-clients\checkconn.ps1 `
+  -Server 192.168.10.20 `
+  -QueueName Canon_LBP2900 `
+  -PrinterName "Canon LBP2900 - Van phong"
+```
+
+Máy trạm Windows dùng driver PostScript chung. Không cài driver CAPT của Canon trên client IPP; driver CAPT chỉ chạy trên máy chủ.
+
+Nếu chính sách Windows không cho phép script tạo cổng, thêm thủ công bằng URI:
+
+```text
+http://192.168.10.20:631/printers/Canon_LBP2900
+```
+
+Thay IP và tên queue theo môi trường thực tế.
+
+## 5. Thêm máy trạm Linux
+
+```bash
+sudo apt install -y cups-client
+sudo lpadmin -p "$QUEUE_NAME" -E \
+  -v "ipp://$PRINT_SERVER_IP:631/printers/$QUEUE_NAME" \
+  -m everywhere
+lpstat -p "$QUEUE_NAME" -l
+```
+
+## 6. Kiểm thử nghiệm thu
+
+Trên máy chủ:
+
+```bash
+lpstat -t
+lp -d "$QUEUE_NAME" /usr/share/cups/data/testprint
+watch -n 1 lpstat -W not-completed -o
+```
+
+Sau đó in một trang thử từ mỗi loại máy trạm. Ghi nhận:
+
+- Tên máy trạm và hệ điều hành.
+- Có truy cập được IPP hay không.
+- Job có xuất hiện và rời queue hay không.
+- Máy in có ra đúng nội dung hay không.
+- Log CUPS có lỗi CAPT hay không.
+
+Lệnh đọc log:
+
+```bash
+sudo tail -n 200 /var/log/cups/error_log
+sudo journalctl -u cups --since '10 minutes ago' --no-pager
+```
+
+## 7. Vận hành định kỳ
+
+### Sau reboot hoặc cắm lại USB
 
 ```bash
 sudo modprobe usblp
-ls -l /dev/usb/lp0          # phai co
-echo usblp | sudo tee /etc/modules-load.d/usblp.conf    # tu nap sau reboot
+ls -l /dev/usb/lp0
+lpstat -p "$QUEUE_NAME" -l
 ```
 
-Nếu `modprobe` xong vẫn chưa có node, reset cổng USB:
+### Xóa job lỗi
 
 ```bash
-P=$(for d in /sys/bus/usb/devices/*/; do [ "$(cat $d/idVendor 2>/dev/null)" = "04a9" ] && basename $d; done | head -1)
-sudo bash -c "echo 0 > /sys/bus/usb/devices/$P/authorized"; sleep 3
-sudo bash -c "echo 1 > /sys/bus/usb/devices/$P/authorized"
+lpstat -W not-completed -o
+cancel <JOB_ID>
+# Chỉ khi đã thông báo người dùng và cần xóa toàn bộ queue:
+cancel -a "$QUEUE_NAME"
 ```
 
-Kiểm tra máy in còn sống mà **không in gì**:
+### Đổi máy chủ hoặc địa chỉ IP
 
-```bash
-sudo python3 -c "
-import fcntl, os
-fd = os.open('/dev/usb/lp0', os.O_RDWR); buf = bytearray(1024)
-fcntl.ioctl(fd, 0x84005001, buf); n = (buf[0]<<8)|buf[1]
-print(buf[2:n].decode('latin-1'))"
-# -> MFG:Canon;MDL:LBP2900;CMD:CAPT;VER:2.1;...
-```
+1. Gán IP/DNS ổn định cho máy chủ mới.
+2. Cài lại driver, patch và queue theo tài liệu này.
+3. Cập nhật URI trên các máy trạm bằng script client.
+4. Xóa queue cũ sau khi xác nhận không còn job cần xử lý.
 
-### Tạo queue và bật chia sẻ
+## 8. Bảng chẩn đoán nhanh
 
-```bash
-# FileDevice can thiet cho URI file://
-grep -q "^FileDevice Yes" /etc/cups/cups-files.conf || echo "FileDevice Yes" | sudo tee -a /etc/cups/cups-files.conf
-
-sudo lpadmin -p Canon_LBP2900 -E \
-  -v file:///dev/null \
-  -P /usr/share/ppd/CanonLBP-2900-3000.ppd \
-  -D "Canon LBP2900 (captdriver, direct USB)"
-
-sudo cupsctl --share-printers --remote-any
-sudo lpadmin -p Canon_LBP2900 -o printer-is-shared=true
-sudo systemctl restart cups
-```
-
-`-v file:///dev/null` là cố ý: filter đã tự ghi thẳng `/dev/usb/lp0`, nên backend CUPS không được tranh thiết bị. Kiểm tra `sudo ss -lntp | grep 631` phải thấy `0.0.0.0:631`, không phải `127.0.0.1`.
-
-## Phía client Windows
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\windows-clients\addipp.ps1
-```
-
-Script tự tạo cổng IPP, chọn driver PostScript có sẵn (`Microsoft PS Class Driver`), thêm máy in tên `Canon LBP2900 (LAN)`, và **không** đổi máy in mặc định.
-
-Quan trọng: máy Windows dùng **driver PostScript chung**, tuyệt đối không cài driver Canon. CUPS phía Linux nhận PostScript rồi mới chuyển sang CAPT.
-
-Làm tay: Settings → Printers → Add printer → *"The printer that I want isn't listed"* → Select a shared printer by name:
-
-```
-http://192.168.1.36:631/printers/Canon_LBP2900
-```
-
-Kiểm tra sau khi cài:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\windows-clients\checkconn.ps1
-```
-
-In ra trạng thái máy in, kết quả TCP tới cổng 631, và mã HTTP của endpoint IPP.
-
-**Chạy qua SSH có làm phiền người dùng không?** Không. `Add-Printer` không bật cửa sổ nào, không cần khởi động lại, không đổi máy in mặc định. Ứng dụng đang mở sẵn hộp thoại In có thể phải đóng/mở lại hộp thoại mới thấy máy in mới.
-
-## Phía client Linux
-
-```bash
-sudo systemctl enable --now cups
-sudo lpadmin -p Canon_LBP2900 -E \
-  -v ipp://192.168.1.36:631/printers/Canon_LBP2900 -m everywhere
-```
-
-### Bẫy: kho apt offline nội bộ
-
-Trên `hn-02` (máy có phần mềm Flygo), CUPS **không cài được** vì kho offline `/usr/local/share/flygo/assets/offline/apt` giữ vài thư viện ở bản **cao hơn** kho Ubuntu, phá vỡ mọi phụ thuộc gắn chính xác phiên bản:
-
-| Gói | Kho offline | Kho Ubuntu |
+| Triệu chứng | Kiểm tra | Xử lý |
 |---|---|---|
-| `libcups2t64` | `2.4.7-1.2ubuntu7.14` | `2.4.7-1.2ubuntu7.4` |
-| `libpoppler134` | `24.02.0-1ubuntu9.9` | `24.02.0-1ubuntu9.7` |
+| Không có `/dev/usb/lp0` | `lsusb`, `lsmod \| grep usblp` | `modprobe usblp`, kiểm tra cáp/cổng, cắm lại USB |
+| `CAPT: unable to communicate` | quyền truy cập và `CAPT_DEVICE` | khôi phục đúng device node, restart CUPS |
+| `CAPT: no reply from printer` | patch/filter đang dùng | build lại filter đã vá, kiểm tra queue dùng `file:///dev/null` |
+| Client không mở được cổng 631 | `Test-NetConnection`/`curl` | kiểm tra CUPS listen, firewall và VLAN ACL |
+| Job đọng nhưng máy đã in | `lpstat`, log CUPS | xác nhận giấy đã ra rồi mới xóa job |
+| Tất cả client cùng lỗi | test trực tiếp trên server | xử lý server/USB trước, không cài lại từng client |
 
-Cách xử lý (hạ hai gói này về bản Ubuntu, rồi cài CUPS bình thường):
+## 9. Checklist bàn giao
 
-```bash
-sudo apt-get install -y --allow-downgrades libcups2t64=2.4.7-1.2ubuntu7.4
-sudo apt-get install -y --allow-downgrades libpoppler134=24.02.0-1ubuntu9.7
-sudo apt-get install -y cups cups-client
-```
-
-Lỗi dẫn đường khá vòng vo: đầu tiên báo `cups-client` xung đột `libcups2t64`, hạ xong lại báo `libcupsfilters2t64 không thể cài được`, đào tiếp mới lộ `libpoppler-cpp0t64` cần `libpoppler134 = .7`. Cứ cài thẳng gói bị kêu là lộ nguyên nhân thật.
-
-## Dọn dẹp khi đổi chỗ máy in
-
-Khi chuyển cáp USB sang máy khác, **nhớ xoá queue cũ** trỏ vào cổng không còn thiết bị — nếu không, ai in vào đó sẽ treo vô thời hạn:
-
-```powershell
-Remove-Printer -Name "Canon LBP2900"       # queue tro vao USB001 cu
-```
-
-Và trên máy Windows từng cắm máy in, kiểm tra cờ `WorkOffline` (xem `windows-troubleshooting.md`).
-
-## Hiện trạng triển khai
-
-| Máy | Vai trò | Trạng thái |
-|---|---|---|
-| `hn-kt-thao` (192.168.1.36) | Server, cắm USB | CUPS chia sẻ `0.0.0.0:631` |
-| `hn-kt-duyen` (.17) | Client Windows | Đã thêm, IPP `200 OK` |
-| `hn-kt-hue` (.20) | Client Windows | Đã thêm, IPP `200 OK` |
-| `hn-kt-my` (.15) | Client Windows | Đã thêm, IPP `200 OK` |
-| `hn-kt-nam` (.19) | Client Windows | Đã thêm, IPP `200 OK` |
-| `hn-02` (.29) | Client Linux | Đã thêm qua IPP |
-
-Client nhìn thấy **hàng đợi dùng chung** của server, nên job lỗi trên server sẽ hiện trong danh sách in của mọi máy — dọn hàng đợi khi có job hỏng để tránh gây bối rối.
+- [ ] Máy chủ có IP/DNS ổn định.
+- [ ] `usblp` tự nạp và `/dev/usb/lp0` xuất hiện sau reboot.
+- [ ] Queue dùng đúng PPD và URI `file:///dev/null`.
+- [ ] TCP 631 chỉ mở trong LAN cần thiết.
+- [ ] Windows và Linux client đều in được trang thử.
+- [ ] Đã lưu tên queue, IP/DNS máy chủ và người/nhóm chịu trách nhiệm vận hành trong hệ thống quản trị nội bộ của đơn vị.
+- [ ] Người vận hành biết cách xem log và xóa job lỗi an toàn.

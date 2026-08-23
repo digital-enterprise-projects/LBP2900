@@ -1,130 +1,181 @@
-# Canon LBP2900 — Hồ sơ vận hành & khắc phục sự cố
+# Canon LBP2900 — hướng dẫn triển khai máy chủ in dùng chung
 
-Tài liệu nội bộ về chiếc **Canon LBP2900** ở văn phòng Hà Nội, đúc kết từ hai phiên xử lý thực tế (13–15/08/2026): máy "không in được", tưởng hỏng, cuối cùng **không hỏng gì cả** — toàn bộ là lỗi trạng thái phần mềm.
+Repository này cung cấp quy trình triển khai Canon LBP2900 theo mô hình:
 
-**Cấu hình hiện tại:** máy in cắm USB vào `hn-kt-thao` (Ubuntu, `192.168.1.36`), chạy `captdriver` đã vá, chia sẻ ra LAN qua CUPS cho 4 máy Windows và 1 máy Linux. Xem [`docs/lan-sharing.md`](docs/lan-sharing.md).
+```text
+Canon LBP2900 (USB)
+  → máy chủ Linux + CUPS + captdriver đã vá
+  → IPP qua mạng LAN
+  → máy trạm Windows/Linux
+```
 
-Repo này gồm: chẩn đoán đầy đủ, script sửa lỗi dùng lại được, một CUPS backend để in từ Linux xuyên qua Windows, và một bản vá cho driver mã nguồn mở `captdriver`.
+Mục tiêu là tạo một hàng đợi in tập trung, không cần cài driver Canon trên từng máy trạm. Tất cả tên máy, địa chỉ IP và tên hàng đợi trong tài liệu đều là giá trị mẫu; đơn vị triển khai thay bằng thông tin của mình.
 
----
+Driver phát hành kèm repository là source `captdriver 0.1.4.1` đã áp patch direct-device, có source đầy đủ, patch rời, giấy phép GPL-3.0 và checksum SHA-256. Xem [hướng dẫn cài đặt và sử dụng](docs/installation.md).
 
-## TL;DR — máy không in, làm gì trước
+## Phạm vi hỗ trợ
 
-Máy in vẫn sáng đèn, Windows vẫn thấy, nhưng job treo mãi không ra giấy:
+- Máy in: Canon LBP2900/LBP3000 sử dụng giao thức CAPT.
+- Máy chủ in: Ubuntu 22.04/24.04 hoặc hệ Debian tương đương.
+- Máy trạm: Windows 10/11 và Linux có IPP.
+- Kết nối: máy in cắm USB trực tiếp vào máy chủ Linux, máy trạm truy cập TCP 631 trong LAN.
+
+Không dùng hướng dẫn này nếu máy in đang được quản lý bởi một print server khác hoặc chính sách mạng không cho phép mở IPP.
+
+## Chuẩn bị thông số
+
+Chọn trước các giá trị sau và dùng nhất quán trong toàn bộ quá trình:
+
+| Biến | Ví dụ | Ý nghĩa |
+|---|---|---|
+| `PRINT_SERVER_IP` | `192.168.10.20` | IP tĩnh hoặc DHCP reservation của máy chủ |
+| `LAN_CIDR` | `192.168.10.0/24` | Dải mạng được phép dùng IPP |
+| `QUEUE_NAME` | `Canon_LBP2900` | Tên queue trong CUPS, không dùng dấu cách |
+| `DISPLAY_NAME` | `Canon LBP2900 - Van phong` | Tên hiển thị trên máy trạm |
+
+Các lệnh dưới đây giả định repository đã được clone và terminal đang đứng tại thư mục repository:
+
+```bash
+REPO_DIR="$PWD"
+PRINT_SERVER_IP="192.168.10.20"
+LAN_CIDR="192.168.10.0/24"
+QUEUE_NAME="Canon_LBP2900"
+```
+
+Hãy sửa ba giá trị mẫu trước khi chạy.
+
+## Triển khai nhanh trên máy chủ Linux
+
+### 1. Cài CUPS và biên dịch driver
+
+```bash
+sudo apt update
+sudo apt install -y build-essential automake autoconf libcups2-dev cups cups-client cups-ppdc git patch
+
+git clone https://github.com/mounaiban/captdriver.git /tmp/captdriver
+cd /tmp/captdriver
+patch -p1 < "$REPO_DIR/captdriver-patch/direct-device-mode.patch"
+autoreconf -i
+./configure
+make
+
+sudo install -m 0755 src/rastertocapt /usr/lib/cups/filter/rastertocapt
+mkdir -p /tmp/captdriver-ppd
+(cd src && ppdc canon-lbp.drv -d /tmp/captdriver-ppd)
+sudo install -m 0644 /tmp/captdriver-ppd/CanonLBP-2900-3000.ppd /usr/share/ppd/CanonLBP-2900-3000.ppd
+```
+
+### 2. Bật thiết bị USB `usblp`
+
+```bash
+echo usblp | sudo tee /etc/modules-load.d/usblp.conf
+sudo modprobe usblp
+ls -l /dev/usb/lp0
+```
+
+Chỉ tiếp tục khi `/dev/usb/lp0` tồn tại. Nếu máy chủ có nhiều máy in USB, xác định đúng node và đặt biến môi trường `CAPT_DEVICE` cho dịch vụ CUPS; xem [ghi chú captdriver](docs/captdriver-notes.md).
+
+### 3. Tạo và chia sẻ queue
+
+```bash
+grep -q '^FileDevice Yes$' /etc/cups/cups-files.conf || \
+  echo 'FileDevice Yes' | sudo tee -a /etc/cups/cups-files.conf
+
+sudo lpadmin -p "$QUEUE_NAME" -E \
+  -v file:///dev/null \
+  -P /usr/share/ppd/CanonLBP-2900-3000.ppd \
+  -D "Canon LBP2900"
+
+sudo lpadmin -p "$QUEUE_NAME" -o printer-is-shared=true
+sudo cupsctl --share-printers --remote-any
+sudo systemctl enable --now cups
+sudo systemctl restart cups
+```
+
+Nếu máy chủ dùng UFW, chỉ mở IPP cho LAN:
+
+```bash
+sudo ufw allow from "$LAN_CIDR" to any port 631 proto tcp
+```
+
+### 4. Xác minh máy chủ
+
+```bash
+lpstat -t
+sudo ss -lntp | grep ':631'
+lp -d "$QUEUE_NAME" /usr/share/cups/data/testprint
+sudo journalctl -u cups --since '5 minutes ago' --no-pager
+```
+
+Kết quả đạt yêu cầu:
+
+- `/dev/usb/lp0` tồn tại.
+- CUPS lắng nghe cổng 631 trên địa chỉ LAN.
+- Job chuyển sang trạng thái hoàn tất và máy in xuất trang thử.
+- Log không có `CAPT: no reply from printer` hoặc `CAPT: unable to communicate with printer`.
+
+## Cài máy trạm
+
+### Windows 10/11
+
+Mở PowerShell với quyền Administrator từ thư mục repository:
 
 ```powershell
-# chạy trên máy Windows cắm máy in, PowerShell với quyền admin
-powershell -ExecutionPolicy Bypass -File scripts\windows\resetprint.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\windows-clients\addipp.ps1 `
+  -Server 192.168.10.20 `
+  -QueueName Canon_LBP2900 `
+  -PrinterName "Canon LBP2900 - Van phong"
+
+powershell -ExecutionPolicy Bypass -File .\scripts\windows-clients\checkconn.ps1 `
+  -Server 192.168.10.20 `
+  -QueueName Canon_LBP2900 `
+  -PrinterName "Canon LBP2900 - Van phong"
 ```
 
-Script sẽ: dọn hàng đợi → dừng Spooler → xoá spool → **disable/enable thiết bị USB** → chạy lại Spooler → bỏ cờ offline → in một trang thử → **tự chấm điểm** bằng bộ đếm của spooler.
+Script không thay đổi máy in mặc định. Máy trạm dùng driver PostScript có sẵn của Windows; việc chuyển sang CAPT được thực hiện trên máy chủ Linux.
 
-Nếu sau đó vẫn không in: tắt nguồn máy in 10 giây, bật lại, chạy lại script. Vẫn không được nữa mới nghĩ tới phần cứng.
+### Linux
 
----
-
-## Đặc điểm quan trọng của LBP2900
-
-Hiểu ba điều này thì mọi triệu chứng kỳ quái đều có lời giải:
-
-1. **Máy host-based (CAPT)** — không hiểu PCL/PostScript. Toàn bộ việc dựng trang do driver trên máy tính làm, máy in chỉ nhận bitmap nén qua giao thức CAPT độc quyền của Canon.
-
-2. **Máy trạng thái CAPT rất dễ vỡ.** Rút cáp giữa chừng, job bị cắt ngang, driver lỗi — controller kẹt ở trạng thái lửng: vẫn trả lời truy vấn USB (device ID) nhưng **không nhận dữ liệu in**. Nhìn từ ngoài y hệt máy hỏng. Tắt bật nguồn hoặc reset thiết bị USB là sạch. Cộng đồng Linux ghi nhận mô hình này suốt ~15 năm, **không có báo cáo nào về hỏng vĩnh viễn**.
-
-3. **Windows không biết khi nào máy in xong.** Driver CAPT không báo ngược tiến độ, nên job hay đọng ở `Printing, Retained` dù giấy đã ra. `PagesPrinted` trên job **không** chứng minh đã in — bộ đếm `TotalPagesPrinted` của spooler mới là thứ đáng tin (xem `printverify.ps1`).
-
----
-
-## Vụ việc 13/08/2026 — chuỗi 4 lỗi chồng nhau
-
-| # | Lỗi | Triệu chứng | Cách phát hiện |
-|---|---|---|---|
-| 1 | Cờ **`WorkOffline`** bật | Windows nhận job, không gửi xuống máy | `Win32_Printer.WorkOffline = True` |
-| 2 | **Tầng USBPRINT hỏng trạng thái** sau khi cáp bị rút/cắm | Job đẩy được 1 trang đầu rồi nghẽn vĩnh viễn | Job treo `Printing`, `TotalPagesPrinted` không tăng |
-| 3 | Job zombie chặn hàng đợi | Mọi job sau xếp hàng vô vọng | `Get-PrintJob` thấy job cũ `Retained` đứng đầu |
-| 4 | (Trên Linux) kênh back-channel CUPS không truyền dữ liệu | captdriver chết ở lệnh CAPT đầu tiên | `CAPT: no reply from printer`; kernel kẹt `usblp_wwait` |
-
-Nguyên nhân khởi phát: **rút cáp USB mang sang máy khác rồi cắm lại**. Windows tự đặt máy in offline khi thiết bị biến mất, và tầng USBPRINT không dựng lại kênh sạch sẽ khi thiết bị quay về.
-
-Thứ tự sửa (đã kiểm chứng):
-
-```
-1. Bỏ cờ WorkOffline           (fixoffline.ps1)
-2. Dọn job zombie              (purgeandtest.ps1)
-3. Reset thiết bị USBPRINT     (resetprint.ps1 - bước quyết định)
-4. Xác minh bằng bộ đếm        (printverify.ps1)
+```bash
+sudo apt install -y cups-client
+sudo lpadmin -p "$QUEUE_NAME" -E \
+  -v "ipp://$PRINT_SERVER_IP:631/printers/$QUEUE_NAME" \
+  -m everywhere
+lpstat -p "$QUEUE_NAME" -l
 ```
 
-Kết quả cuối: job rời hàng đợi trong 4 giây, `TotalPagesPrinted 0 → 1`, giấy ra.
+## Vận hành và khắc phục sự cố
 
-**Bài học đắt nhất:** đừng tin `PagesPrinted=1` trên job, và đừng tin exit code của ứng dụng in. Trong vụ này cả hai đều báo "thành công" trong khi trang chưa hề được xác nhận. Ba dấu hiệu phải cùng xuất hiện: job **tự rời** hàng đợi + `TotalPagesPrinted` **tăng** + giấy ra thật.
+Thực hiện kiểm tra theo thứ tự:
 
----
+1. Kiểm tra nguồn, giấy, mực, nắp máy và đèn báo.
+2. Trên máy chủ, kiểm tra `ls -l /dev/usb/lp0`.
+3. Kiểm tra queue bằng `lpstat -t` và xóa job lỗi nếu cần bằng `cancel -a "$QUEUE_NAME"`.
+4. Kiểm tra log bằng `journalctl -u cups` và `/var/log/cups/error_log`.
+5. Nếu mất node USB, chạy `sudo modprobe usblp`, rút/cắm lại cáp rồi kiểm tra lại.
+6. Chỉ reset nguồn máy in sau khi đã xác nhận không còn job đang xử lý.
 
-## Thư mục repo
+Chi tiết:
 
-```
-scripts/windows/          Bộ script PowerShell chạy trên máy cắm máy in
-  resetprint.ps1            Reset đầy đủ + in thử + tự chấm điểm  <- dùng cái này trước
-  printverify.ps1           In kèm thu thập mọi bằng chứng (bộ đếm, event log)
-  fixoffline.ps1            Bỏ cờ WorkOffline (WMI, fallback registry)
-  purgeandtest.ps1          Dọn sạch hàng đợi, kể cả job lì
-  canonstatus.ps1           Đọc trạng thái chi tiết (WMI DetectedErrorState...)
+- [Cài đặt, sử dụng và tự áp patch](docs/installation.md)
+- [Triển khai và bảo mật chia sẻ LAN](docs/lan-sharing.md)
+- [Cơ chế bản vá captdriver](docs/captdriver-notes.md)
 
-scripts/linux/            In từ Linux khi máy in cắm ở máy Windows
-  winbridge                 CUPS backend: CUPS -> scp -> SumatraPDF -> driver Canon
+## Cấu trúc repository
 
-scripts/windows-clients/  Chạy trên máy Windows để dùng máy in chia sẻ từ Linux
-  addipp.ps1                Thêm máy in qua IPP, driver PostScript, không đổi mặc định
-  checkconn.ps1             Kiểm tra máy Windows có kết nối được tới server không
-  listprinters.ps1          Liệt kê máy in đang cài trên máy đó
-
-captdriver-patch/         Cho trường hợp cắm máy in trực tiếp vào Linux
-  direct-device-mode.patch  Vá captdriver nói thẳng /dev/usb/lp0
-
+```text
+captdriver-patch/
+  direct-device-mode.patch       Bổ sung chế độ truy cập trực tiếp /dev/usb/lpN
 docs/
-  lan-sharing.md               Cấu hình đang chạy: chia sẻ từ Linux ra LAN  <- đọc cái này
-  windows-troubleshooting.md   Quy trình chẩn đoán từng bước trên Windows
-  linux-bridge.md              Bridge in từ Ubuntu qua Windows (phương án thay thế)
-  captdriver-notes.md          Ghi chép về driver Linux + bản vá
+  installation.md                Cài từ release hoặc tự áp patch rồi build
+  lan-sharing.md                 Quy trình triển khai CUPS/IPP chi tiết
+  captdriver-notes.md            Giải thích kỹ thuật và cách chẩn đoán
+scripts/windows-clients/         Cài đặt và kiểm tra máy trạm Windows qua IPP
+scripts/release/                 Tạo lại gói source driver đã patch
 ```
 
----
+## Lưu ý an toàn
 
-## In từ Linux — hai con đường
-
-### Đường 1: bridge qua Windows (phương án dự phòng)
-
-Máy in giữ nguyên ở máy Windows. Máy Linux in qua CUPS backend `winbridge`:
-
-```
-CUPS (queue Canon_LBP2900_Bridge, PPD Generic PDF)
-  -> scp file PDF sang máy Windows (SSH key)
-  -> SumatraPDF -print-to "Canon LBP2900" -silent
-  -> driver Canon chính chủ dựng trang -> USB
-```
-
-Ưu: driver Windows chính chủ, ổn định. Nhược: máy Windows phải bật. Dùng khi captdriver không chạy được trên phần cứng cụ thể.
-Chi tiết cài đặt: [`docs/linux-bridge.md`](docs/linux-bridge.md)
-
-### Đường 2: cắm thẳng vào Linux + captdriver — ĐANG DÙNG
-
-Driver mã nguồn mở [captdriver](https://github.com/mounaiban/captdriver) chạy được trên Ubuntu 24.04, **nhưng** trên máy chúng tôi kênh side/back-channel của CUPS không truyền dữ liệu, driver chết ở lệnh CAPT đầu tiên — đúng [Issue #16](https://github.com/agalakhov/captdriver/issues/16) tồn tại nhiều năm.
-
-Bản vá trong `captdriver-patch/` thêm **chế độ nói thẳng `/dev/usb/lp0`** (bỏ qua kênh CUPS). **Đã in ra giấy thành công** (Job 109, 15/08/2026, 0 lỗi CAPT trong log).
-
-Đây là cấu hình đang chạy: máy in cắm ở `hn-kt-thao`, chia sẻ ra LAN cho các máy Windows và Linux khác. Xem [`docs/lan-sharing.md`](docs/lan-sharing.md).
-
-⚠️ Điều kiện sống còn: `/dev/usb/lp0` phải tồn tại (cần `usblp`). Mất node này là mọi job chết với `CAPT: unable to communicate with printer`.
-
-Chi tiết kỹ thuật: [`docs/captdriver-notes.md`](docs/captdriver-notes.md)
-
----
-
-## Quy tắc vận hành rút ra
-
-- **Đừng rút cáp USB máy in đang chia sẻ** trừ khi thật cần. Nếu rút, khi cắm lại hãy chạy `resetprint.ps1` luôn cho chắc.
-- Máy in "đơ" ≠ máy in hỏng. Với LBP2900, 99% là trạng thái kẹt — reset USB + tắt bật nguồn giải quyết.
-- Xoá job của người khác thì phải báo cho họ in lại — job `Retained` có thể đã in xong, nhưng job `Normal` phía sau thì chưa.
-- Đèn LED trên máy là nguồn chân lý duy nhất về phần cứng: xanh đứng yên = khoẻ, cam/nháy = xem mực/giấy/nắp.
-- Sau mỗi lần reboot máy chủ in hoặc cắm lại cáp: kiểm tra `/dev/usb/lp0` trước khi kết luận máy in hỏng.
+- Chỉ mở TCP 631 cho mạng tin cậy; không công khai CUPS ra Internet.
+- `file:///dev/null` là cấu hình có chủ đích: filter đã vá ghi trực tiếp vào thiết bị, backend CUPS không được giữ cổng USB lần thứ hai.
+- Sau khi đổi cổng USB, reboot hoặc cập nhật kernel, luôn kiểm tra lại `/dev/usb/lp0` trước khi nhận yêu cầu in.

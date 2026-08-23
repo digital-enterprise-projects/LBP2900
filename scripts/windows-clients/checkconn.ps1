@@ -1,5 +1,15 @@
-$name = 'Canon LBP2900 (LAN)'
-$srv  = '192.168.1.36'
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$Server,
+  [string]$QueueName = 'Canon_LBP2900',
+  [string]$PrinterName = 'Canon LBP2900 (LAN)',
+  [ValidateRange(1, 65535)]
+  [int]$Port = 631
+)
+
+$name = $PrinterName
+$srv = $Server
+$uri = "http://$srv`:$Port/printers/$QueueName"
 
 Write-Output ("HOST: " + $env:COMPUTERNAME)
 
@@ -10,11 +20,11 @@ if ($p) {
   Write-Output "  may in   : KHONG CO"
 }
 
-$tcp = Test-NetConnection -ComputerName $srv -Port 631 -WarningAction SilentlyContinue
-Write-Output ("  toi " + $srv + ":631 : " + $(if ($tcp.TcpTestSucceeded) { "KET NOI DUOC" } else { "KHONG TOI DUOC" }))
+$tcp = Test-NetConnection -ComputerName $srv -Port $Port -WarningAction SilentlyContinue
+Write-Output ("  toi " + $srv + ":" + $Port + " : " + $(if ($tcp.TcpTestSucceeded) { "KET NOI DUOC" } else { "KHONG TOI DUOC" }))
 
 try {
-  $r = Invoke-WebRequest -Uri "http://$srv`:631/printers/Canon_LBP2900" -UseBasicParsing -TimeoutSec 10
+  $r = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 10
   Write-Output ("  HTTP IPP  : " + $r.StatusCode + " OK")
 } catch {
   Write-Output ("  HTTP IPP  : loi - " + $_.Exception.Message.Split([Environment]::NewLine)[0])

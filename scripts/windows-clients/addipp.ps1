@@ -1,5 +1,15 @@
-$printerName = 'Canon LBP2900 (LAN)'
-$uri         = 'http://192.168.1.36:631/printers/Canon_LBP2900'
+param(
+  [Parameter(Mandatory = $true)]
+  [string]$Server,
+  [string]$QueueName = 'Canon_LBP2900',
+  [string]$PrinterName = 'Canon LBP2900 (LAN)',
+  [ValidateRange(1, 65535)]
+  [int]$Port = 631,
+  [string]$DriverName
+)
+
+$printerName = $PrinterName
+$uri = "http://$Server`:$Port/printers/$QueueName"
 
 Write-Output ("HOST: " + $env:COMPUTERNAME)
 
@@ -20,11 +30,15 @@ if (-not (Get-PrinterPort -Name $uri -ErrorAction SilentlyContinue)) {
 
 # Driver PostScript co san cua Windows - KHONG dung driver Canon
 $driver = $null
-foreach ($d in @('Microsoft PS Class Driver', 'MS Publisher Imagesetter', 'Generic / Text Only')) {
+$candidates = if ($DriverName) { @($DriverName) } else { @('Microsoft PS Class Driver', 'MS Publisher Imagesetter') }
+foreach ($d in $candidates) {
   if (Get-PrinterDriver -Name $d -ErrorAction SilentlyContinue) { $driver = $d; break }
   try { Add-PrinterDriver -Name $d -ErrorAction Stop; $driver = $d; break } catch { }
 }
-if (-not $driver) { Write-Output "  KHONG tim duoc driver PostScript"; exit 1 }
+if (-not $driver) {
+  Write-Output "  KHONG tim duoc driver PostScript. Cai driver hoac truyen -DriverName."
+  exit 1
+}
 Write-Output ("  driver: " + $driver)
 
 try {
